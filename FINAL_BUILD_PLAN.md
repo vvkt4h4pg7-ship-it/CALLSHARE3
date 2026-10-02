@@ -37,9 +37,9 @@ The intended state is:
 
 `call ends / CallKit deactivates -> VoiceEngine.stop() -> microphone OFF`
 
-## Remaining voice-codec boundary
+## Voice path now implemented
 
-The supplied Android source uses AMR-NB. The current iOS adapter intentionally remains a boundary because the supplied `libamr-codec.so` files are Android ARM binaries and cannot be linked as native iOS libraries. The 8 kHz PCM capture/conversion path is present, but live AMR encode/decode requires an iOS-compatible AMR-NB implementation to be added before end-to-end speech can be claimed.
+The supplied Android source uses AMR-NB. The iOS project now contains an iOS-compatible OpenCORE AMR-NB encoder/decoder wrapper. The audio path is therefore implemented through the verified channel-3 framing: 8 kHz mono PCM -> AMR-NB -> BLE TX, and BLE RX -> AMR-NB -> 8 kHz PCM playback. End-to-end speech still requires a live peer test; this package does not claim that hardware playback has been proven inside the container.
 
 ## Outgoing active-call extension
 

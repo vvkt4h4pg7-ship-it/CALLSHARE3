@@ -30,4 +30,4 @@ Control frame is C0-delimited with length/checksum and C0/DB escaping.
 
 Channel 3. The Android source captures 8 kHz mono 16-bit PCM, frames 160 samples and encodes AMR-NB.
 
-The final iOS transport/framing and 8 kHz capture boundary are implemented, while an iOS-native AMR-NB codec is still required for live speech.
+The iOS project now includes an iOS-compatible OpenCORE AMR-NB encoder/decoder boundary. Live speech still depends on the peer delivering/accepting the verified channel-3 AMR frames.

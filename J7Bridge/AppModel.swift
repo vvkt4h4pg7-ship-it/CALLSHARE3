@@ -177,6 +177,15 @@ final class AppModel: ObservableObject {
             log("[CALL] ANSWER EVENT / ACTIVE")
             callKit.fulfillAnswerIfNeeded()
             beginCallIfNeeded(direction: currentDirection ?? .incoming)
+
+            if currentDirection == .outgoing {
+                // CallKit only treats an outgoing call as connected after this
+                // explicit provider update; that transition is what allows the
+                // system to activate the call audio session reliably.
+                callKit.reportOutgoingConnected()
+                log("[CALLKIT] OUTGOING connected -> audio activation armed")
+            }
+
             remoteVoiceOpen = false
             ble.sendVoiceOpen()
 
@@ -266,6 +275,7 @@ final class AppModel: ObservableObject {
     }
 
     private func endFromCallKit() {
+        ble.sendVoiceClose()
         ble.sendHangup()
         remoteVoiceOpen = false
         voice.stop()

@@ -79,33 +79,13 @@ final class VoiceEngine: NSObject {
     /// PCM boundary used by AMR-NB.
     func start() {
         guard !isRunning else { return }
-        NSLog("[J7BRIDGE_DIAG] VoiceEngine.start ENTER")
 
         do {
-            // CallKit must have activated the session before this method is
-            // reached. Configure the same voice-call category used by the
-            // working SIMPlus architecture, then explicitly force the speaker
-            // route for the default test path so audio is not stranded on the
-            // receiver/Bluetooth route.
-            try applySessionCategory()
+            applySessionCategory()
+            try? audioSession.setPreferredSampleRate(8_000)
+            try? audioSession.setPreferredIOBufferDuration(0.02)
 
-            do {
-                try audioSession.setPreferredSampleRate(8_000)
-            } catch {
-                reportStatus("[AUDIO] preferred 8 kHz rejected; actual=\(Int(audioSession.sampleRate)) Hz")
-            }
-
-            do {
-                try audioSession.setPreferredIOBufferDuration(0.02)
-            } catch {
-                reportStatus("[AUDIO] preferred IO buffer rejected; actual=\(audioSession.ioBufferDuration)s")
-            }
-
-            reportStatus(
-                "[VOICE] starting; active=\(audioSession.isInputAvailable) " +
-                "rate=\(Int(audioSession.sampleRate))Hz io=\(Int(audioSession.ioBufferDuration * 1000))ms " +
-                "route=\(routeDescription())"
-            )
+            reportStatus("[VOICE] starting; route=\(routeDescription())")
 
             guard codec.isReady else {
                 throw NSError(
@@ -173,7 +153,6 @@ final class VoiceEngine: NSObject {
             audioEngine.prepare()
             try audioEngine.start()
             playerNode.play()
-            NSLog("[J7BRIDGE_DIAG] VoiceEngine OPEN OK")
 
             reportStatus(
                 String(
@@ -204,7 +183,6 @@ final class VoiceEngine: NSObject {
         converter = nil
         pcmAccumulator.removeAll(keepingCapacity: true)
         codec.reset()
-        try? audioSession.overrideOutputAudioPort(.none)
         reportStatus("CLOSED / codec reset")
     }
 
@@ -214,7 +192,6 @@ final class VoiceEngine: NSObject {
     /// uses the same mode instead of assuming MR122 forever.
     func receiveAMR(_ packet: Data) {
         guard !packet.isEmpty else { return }
-        if rxFrames == 0 && invalidRx == 0 && droppedRx == 0 { reportStatus("[AMR] RECEIVE ENTRY len=\(packet.count)") }
 
         guard isRunning else {
             droppedRx += 1
@@ -222,10 +199,6 @@ final class VoiceEngine: NSObject {
                 reportStatus("[AMR] RX dropped while voice engine stopped len=\(packet.count)")
             }
             return
-        }
-
-        if rxFrames == 0 || rxFrames % 25 == 0 {
-            NSLog("[J7BRIDGE_DIAG] receiveAMR len=\(packet.count)")
         }
 
         guard let frameInfo = codec.validateAndLearnMode(packet) else {
@@ -241,19 +214,6 @@ final class VoiceEngine: NSObject {
             return
         }
 
-        let minSample = pcm.min() ?? 0
-        let maxSample = pcm.max() ?? 0
-        let nonZero = pcm.reduce(into: 0) { count, sample in
-            if sample != 0 { count += 1 }
-        }
-
-        if rxFrames == 0 || rxFrames % 25 == 0 {
-            reportStatus(
-                "[AMR] PCM CHECK rx=\(rxFrames + 1) min=\(minSample) max=\(maxSample) nonZero=\(nonZero)/160"
-            )
-                NSLog("[J7BRIDGE_DIAG] PCM min=\(minSample) max=\(maxSample) nonZero=\(nonZero)")
-        }
-
         rxFrames += 1
         if rxFrames == 1 || rxFrames % 25 == 0 {
             reportStatus(
@@ -265,27 +225,17 @@ final class VoiceEngine: NSObject {
         schedulePlayback(pcm)
     }
 
-    private func applySessionCategory() throws {
+    private func applySessionCategory() {
         var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
         if useSpeaker {
             options.insert(.defaultToSpeaker)
         }
 
-        try audioSession.setCategory(
+        try? audioSession.setCategory(
             .playAndRecord,
             mode: .voiceChat,
             options: options
         )
-
-        if useSpeaker {
-            do {
-                try audioSession.overrideOutputAudioPort(.speaker)
-            } catch {
-                // The call session may temporarily own routing. Do not fail
-                // the entire engine solely because an override is unavailable.
-                reportStatus("[AUDIO] speaker override deferred: \(error.localizedDescription)")
-            }
-        }
     }
 
     private func inputRemoveTapSafely() {
@@ -366,10 +316,7 @@ final class VoiceEngine: NSObject {
 
     private func schedulePlayback(_ pcm: [Int16]) {
         guard pcm.count == 160 else { return }
-        if !audioEngine.isRunning {
-            reportStatus("[AUDIO] PLAYBACK DROP engineRunning=NO")
-            return
-        }
+        guard audioEngine.isRunning else { return }
 
         guard let buffer = AVAudioPCMBuffer(
             pcmFormat: pcm8kFormat,
@@ -392,9 +339,6 @@ final class VoiceEngine: NSObject {
         }
 
         playerNode.scheduleBuffer(buffer, completionHandler: nil)
-        if rxFrames == 0 || rxFrames % 25 == 0 {
-            NSLog("[J7BRIDGE_DIAG] playback scheduled samples=160 route=\(routeDescription())")
-        }
 
         if !playerNode.isPlaying {
             playerNode.play()

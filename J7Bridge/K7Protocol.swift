@@ -61,6 +61,9 @@ enum K7Protocol {
         return out
     }
 
+    /// Channel-3 audio framing used by the working Android/K7 transport.
+    /// A normal AMR-NB speech frame is 13...32 bytes including its ToC byte;
+    /// the complete BLE frame therefore remains comfortably below the BLE MTU.
     static func wrapAudio(_ payload: Data) -> Data {
         let length = payload.count
         let h0 = UInt8(((length & 0x0F) << 4) | 0x03)
@@ -100,6 +103,59 @@ enum K7Protocol {
         guard ((Int(h0) + Int(h1) + Int(checksum)) & 0xFF) == 0 else { return nil }
         guard length == bytes.count - 3, (h0 & 0x0F) == 3 else { return nil }
         return (3, Data(bytes[3..<bytes.count]))
+    }
+
+    /// Incremental C0-delimited parser. CoreBluetooth normally delivers one
+    /// characteristic value per callback, but this also handles a frame split
+    /// across callbacks or multiple frames delivered back-to-back. Escaping is
+    /// preserved until a complete frame is available.
+    final class StreamParser {
+        private var buffer: [UInt8] = []
+        private let maximumBufferedBytes = 8_192
+
+        func reset() {
+            buffer.removeAll(keepingCapacity: true)
+        }
+
+        func feed(_ data: Data) -> [(channel: Int, payload: Data)] {
+            guard !data.isEmpty else { return [] }
+            buffer.append(contentsOf: data)
+
+            if buffer.count > maximumBufferedBytes {
+                // A malformed stream must not be allowed to grow without bound.
+                // Keep only the tail, which may still contain a new delimiter.
+                buffer = Array(buffer.suffix(256))
+            }
+
+            var result: [(channel: Int, payload: Data)] = []
+
+            while !buffer.isEmpty {
+                guard let start = buffer.firstIndex(of: 0xC0) else {
+                    buffer.removeAll(keepingCapacity: true)
+                    break
+                }
+
+                if start > 0 {
+                    buffer.removeFirst(start)
+                }
+
+                guard buffer.count >= 2 else { break }
+                guard let end = buffer.dropFirst().firstIndex(of: 0xC0) else {
+                    break
+                }
+
+                let frame = Data(buffer[0...end])
+                buffer.removeFirst(end + 1)
+
+                if let parsed = K7Protocol.parse(frame) {
+                    result.append(parsed)
+                }
+                // Empty C0/C0 boundaries and invalid frames are deliberately
+                // consumed so they cannot poison the next valid frame.
+            }
+
+            return result
+        }
     }
 
     static func decodeIncomingNumber(_ payload: Data) -> String {
