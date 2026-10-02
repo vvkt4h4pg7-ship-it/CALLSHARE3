@@ -63,11 +63,11 @@ final class VoiceEngine: NSObject {
     }()
 
     func setSpeakerDefault(_ enabled: Bool) {
-        useSpeaker = enabled
-        if isRunning {
-            applySessionCategory()
-        }
+    useSpeaker = enabled
+    if isRunning {
+        try? applySessionCategory()
     }
+}
 
     func setMuted(_ value: Bool) {
         muted = value
