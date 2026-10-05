@@ -91,6 +91,10 @@ final class AppModel: ObservableObject {
         callKit.onDTMF = { [weak self] digits in
             self?.sendDTMFString(digits)
         }
+        callKit.onPrepareAudio = { [weak self] in
+            self?.voice.prepareForCallAudio()
+        }
+
         callKit.onAudioActivated = { [weak self] in
             self?.callAudioActive = true
             self?.maybeStartVoice()
@@ -261,22 +265,22 @@ final class AppModel: ObservableObject {
     }
 
     private func maybeStartVoice() {
-        guard callStatus == "ACTIVE" else {
-            log("[VOICE] WAIT call not ACTIVE state=\(callStatus)")
-            return
-        }
+guard callStatus == "ACTIVE" else {
+    log("[VOICE] WAIT call not ACTIVE state=\(callStatus)")
+    return
+}
 
-        guard remoteVoiceOpen else {
-            log("[VOICE] WAIT remote VOICE_OPEN")
-            return
-        }
+guard remoteVoiceOpen else {
+    log("[VOICE] WAIT remote VOICE_OPEN")
+    return
+}
 
-        guard callAudioActive else {
-            log("[VOICE] WAIT CallKit audio activation")
-            return
-        }
+guard callAudioActive else {
+    log("[VOICE] WAIT CallKit audio activation")
+    return
+}
 
-        log("[VOICE] START gate satisfied -> VoiceEngine.start()")
+log("[VOICE] START gate satisfied -> VoiceEngine.start()")
         voice.start()
     }
 

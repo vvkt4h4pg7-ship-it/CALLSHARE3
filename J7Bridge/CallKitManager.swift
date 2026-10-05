@@ -14,6 +14,7 @@ final class CallKitManager: NSObject {
     var onDTMF: ((String) -> Void)?
     var onAudioActivated: (() -> Void)?
     var onAudioDeactivated: (() -> Void)?
+    var onPrepareAudio: (() -> Void)?
     var onLog: ((String) -> Void)?
 
     override init() {
@@ -122,6 +123,8 @@ extension CallKitManager: CXProviderDelegate {
 
     func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
         currentUUID = action.callUUID
+        onPrepareAudio?()
+        onLog?("[CALLSHARE_AUDIO_R1] PREPARE before CallKit activation (outgoing)")
         reportOutgoingConnecting()
         onLog?("[CALLKIT] START action -> BLE MAKE CALL")
         onStart?(action.handle.value)
@@ -130,6 +133,8 @@ extension CallKitManager: CXProviderDelegate {
 
     func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         answerAction = action
+        onPrepareAudio?()
+        onLog?("[CALLSHARE_AUDIO_R1] PREPARE before CallKit activation (answer)")
         onLog?("[CALLKIT] ANSWER action -> BLE 05; waiting for K7 05")
         onAnswer?()
     }
@@ -158,11 +163,24 @@ extension CallKitManager: CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
+        onLog?("[CALLSHARE_AUDIO_R1] didActivate CALLED")
+        onLog?("[CALLSHARE_AUDIO_R1] session category=\\(audioSession.category.rawValue)")
+        onLog?("[CALLSHARE_AUDIO_R1] session mode=\\(audioSession.mode.rawValue)")
+        onLog?("[CALLSHARE_AUDIO_R1] sampleRate=\\(audioSession.sampleRate)")
+        onLog?("[CALLSHARE_AUDIO_R1] inputChannels=\\(audioSession.inputNumberOfChannels)")
+        onLog?("[CALLSHARE_AUDIO_R1] outputChannels=\\(audioSession.outputNumberOfChannels)")
+        onLog?("[CALLSHARE_AUDIO_R1] ioBuffer=\\(audioSession.ioBufferDuration)")
+        let route = audioSession.currentRoute
+        let inputs = route.inputs.map { "\\($0.portType.rawValue):\\($0.portName)" }.joined(separator: ",")
+        let outputs = route.outputs.map { "\\($0.portType.rawValue):\\($0.portName)" }.joined(separator: ",")
+        onLog?("[CALLSHARE_AUDIO_R1] route IN[\\(inputs)] OUT[\\(outputs)]")
+        onLog?("[CALLSHARE_AUDIO_R1] hardwareSampleRate=\\(audioSession.sampleRate)")
         onLog?("[CALLKIT] audio session ACT")
         onAudioActivated?()
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        onLog?("[CALLSHARE_AUDIO_R1] didDeactivate CALLED")
         onLog?("[CALLKIT] audio session DEACT")
         onAudioDeactivated?()
     }
