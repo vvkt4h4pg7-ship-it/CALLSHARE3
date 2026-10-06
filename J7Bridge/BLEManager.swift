@@ -12,7 +12,7 @@ final class BLEManager: NSObject, ObservableObject {
     private var rxNotifyEnabled = false
     private var audioWriteType: CBCharacteristicWriteType = .withoutResponse
     private var audioTXQueue: [Data] = []
-    private let maxQueuedAudioFrames = 100
+    private let maxQueuedAudioFrames = 25
     private var audioTXCount = 0
     private var audioTXBackpressureEvents = 0
     private var audioTXQueueDrops = 0
@@ -60,9 +60,20 @@ final class BLEManager: NSObject, ObservableObject {
     }
 
     func sendVoiceClose() {
-        audioTXQueue.removeAll(keepingCapacity: true)
+        clearPendingAudio()
         sendControl(Data([K7Protocol.evtVoiceClose]))
         log("[VOICE] CLOSE requested; audio queue cleared")
+    }
+
+    /// Clears only the audio TX backlog. GATT stays connected and all control
+    /// characteristics remain intact. Used at every CallShare session boundary
+    /// to prevent AMR from an old call being sent into the next call.
+    func clearPendingAudio() {
+        let cleared = audioTXQueue.count
+        audioTXQueue.removeAll(keepingCapacity: true)
+        if cleared > 0 {
+            log("[BLE] audio TX backlog cleared frames=\(cleared)")
+        }
     }
 
     func sendMakeCall(number: String, simId: UInt8) {
@@ -101,6 +112,7 @@ final class BLEManager: NSObject, ObservableObject {
         if audioTXQueue.count > maxQueuedAudioFrames {
             // Preserve low latency: drop the oldest frame instead of allowing
             // an ever-growing queue to turn a live call into delayed audio.
+            // 25 frames caps this transport backlog at ~500 ms.
             audioTXQueue.removeFirst(audioTXQueue.count - maxQueuedAudioFrames)
             audioTXQueueDrops += 1
             if audioTXQueueDrops == 1 || audioTXQueueDrops % 25 == 0 {

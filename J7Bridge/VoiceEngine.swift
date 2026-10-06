@@ -48,6 +48,38 @@ final class VoiceEngine: NSObject {
     var onStatus: ((String) -> Void)?
 
     private let codec = AMRCodecAdapter()
+
+    // All RX decode work is deliberately kept off the CoreBluetooth/SwiftUI
+    // main queue. This is the most important latency fix on iPhone: a burst of
+    // 20 ms BLE packets can no longer monopolize the UI queue while AMR decode
+    // and AVAudioPlayerNode scheduling happen synchronously.
+    private let rxQueue = DispatchQueue(
+        label: "com.ugur.callshare.voice.rx",
+        qos: .userInitiated
+    )
+    private let stateLock = NSLock()
+
+    private var pendingRXFrames: [Data] = []
+    private let maxPendingRXFrames = 25       // 500 ms @ 20 ms/frame
+
+    // This is a second bounded queue used only to prevent GCD itself from
+    // accumulating thousands of RX blocks when AMR decode is temporarily
+    // slower than the 20 ms packet arrival rate. Oldest frames are discarded
+    // so latency stays bounded instead of turning into delayed speech.
+    private var rxWorkQueue: [(Data, UInt64)] = []
+    private let maxRXWorkFrames = 20         // 400 ms @ 20 ms/frame
+    private var rxWorkerScheduled = false
+
+    private var acceptsRX = false
+    private var sessionGeneration: UInt64 = 0
+
+    // Playback is also bounded. If the phone receives an abnormal burst, we
+    // reset the player backlog instead of turning that burst into seconds of
+    // delayed speech.
+    private var playbackGeneration: UInt64 = 0
+    private var scheduledPlaybackFrames = 0
+    private let maxScheduledPlaybackFrames = 10 // 200 ms
+
     private var pcmAccumulator: [Int16] = []
     private var txFrames = 0
     private var rxFrames = 0
@@ -71,9 +103,75 @@ final class VoiceEngine: NSObject {
     }
 
     func setMuted(_ value: Bool) {
+        stateLock.lock()
         muted = value
+        stateLock.unlock()
         reportStatus(value ? "MUTED" : "UNMUTED")
     }
+
+    /// Start accepting GSM AMR for a fresh call. This is separate from
+    /// start()/stop(): CallKit audio can be temporarily inactive while the
+    /// GSM call itself is still alive, so queued RX belongs to the call session,
+    /// not to the audio-engine running state.
+    func beginCallSession() {
+        rxQueue.sync { }
+
+        stateLock.lock()
+        sessionGeneration &+= 1
+        acceptsRX = true
+        isRunning = false
+        converter = nil
+        pendingRXFrames.removeAll(keepingCapacity: true)
+        rxWorkQueue.removeAll(keepingCapacity: true)
+        rxWorkerScheduled = false
+        playbackGeneration &+= 1
+        scheduledPlaybackFrames = 0
+        txFrames = 0
+        rxFrames = 0
+        droppedRx = 0
+        invalidRx = 0
+        pcmAccumulator.removeAll(keepingCapacity: true)
+        stateLock.unlock()
+
+        playerNode.stop()
+        playerNode.reset()
+        audioEngine.stop()
+        audioEngine.reset()
+        codec.reset()
+        audioSessionPrepared = false
+
+        reportStatus("CALL SESSION READY")
+    }
+
+    /// Permanently invalidate the current call's RX data. Old BLE packets that
+    /// arrive after hangup can therefore never leak into the next call.
+    func endCallSession() {
+        stateLock.lock()
+        sessionGeneration &+= 1
+        acceptsRX = false
+        isRunning = false
+        converter = nil
+        pendingRXFrames.removeAll(keepingCapacity: true)
+        rxWorkQueue.removeAll(keepingCapacity: true)
+        playbackGeneration &+= 1
+        scheduledPlaybackFrames = 0
+        pcmAccumulator.removeAll(keepingCapacity: true)
+        stateLock.unlock()
+
+        // Wait for an already-running RX decode block to observe the new
+        // generation before tearing down the player graph.
+        rxQueue.sync { }
+
+        playerNode.stop()
+        playerNode.reset()
+        audioEngine.stop()
+        audioEngine.reset()
+        codec.reset()
+        audioSessionPrepared = false
+
+        reportStatus("CALL SESSION INVALIDATED / RX QUEUE CLEARED")
+    }
+
     /// Prepare the CallKit-owned audio session before CallKit activates it.
     /// We deliberately do NOT call setActive(true) here.
     func prepareForCallAudio() {
@@ -88,21 +186,28 @@ final class VoiceEngine: NSObject {
             try audioSession.setPreferredIOBufferDuration(0.02)
             audioSessionPrepared = true
 
-            NSLog("[CALLSHARE_AUDIO_R1] PREPARED category=\\(audioSession.category.rawValue) mode=\\(audioSession.mode.rawValue)")
-            NSLog("[CALLSHARE_AUDIO_R1] preferred sampleRate=\\(audioSession.sampleRate) ioBuffer=\\(audioSession.ioBufferDuration)")
+            NSLog("[CALLSHARE_AUDIO_R1] PREPARED category=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue)")
+            NSLog("[CALLSHARE_AUDIO_R1] preferred sampleRate=\(audioSession.sampleRate) ioBuffer=\(audioSession.ioBufferDuration)")
         } catch {
             audioSessionPrepared = false
-            NSLog("[CALLSHARE_AUDIO_R1] PREPARE ERROR \\(error)")
-            reportStatus("[AUDIO] session prepare ERROR: \\(error.localizedDescription)")
+            NSLog("[CALLSHARE_AUDIO_R1] PREPARE ERROR \(error)")
+            reportStatus("[AUDIO] session prepare ERROR: \(error.localizedDescription)")
         }
     }
-
 
     /// CallKit activates AVAudioSession first. This method then opens the
     /// microphone and starts the playback graph using the same 8 kHz mono
     /// PCM boundary used by AMR-NB.
     func start() {
-        guard !isRunning else { return }
+        stateLock.lock()
+        let runningAndEngineAlive = isRunning && audioEngine.isRunning
+        if isRunning && !audioEngine.isRunning {
+            isRunning = false
+        }
+        stateLock.unlock()
+
+        guard !runningAndEngineAlive else { return }
+
         NSLog("[J7BRIDGE_DIAG] VoiceEngine.start ENTER")
 
         do {
@@ -111,9 +216,9 @@ final class VoiceEngine: NSObject {
                 prepareForCallAudio()
             }
 
-            reportStatus("[VOICE] starting; route=\\(routeDescription())")
-            NSLog("[CALLSHARE_AUDIO_R1] START session active-state route=\\(routeDescription())")
-            NSLog("[CALLSHARE_AUDIO_R1] START sampleRate=\\(audioSession.sampleRate) input=\\(audioSession.inputNumberOfChannels) output=\\(audioSession.outputNumberOfChannels)")
+            reportStatus("[VOICE] starting; route=\(routeDescription())")
+            NSLog("[CALLSHARE_AUDIO_R1] START route=\(routeDescription())")
+            NSLog("[CALLSHARE_AUDIO_R1] START sampleRate=\(audioSession.sampleRate) input=\(audioSession.inputNumberOfChannels) output=\(audioSession.outputNumberOfChannels)")
 
             guard codec.isReady else {
                 throw NSError(
@@ -123,8 +228,7 @@ final class VoiceEngine: NSObject {
                 )
             }
 
-            // Each call gets fresh codec state so encoder prediction and decoder
-            // history cannot bleed across GSM calls.
+            // A decoder/encoder state belongs to one GSM call only.
             codec.reset()
             guard codec.isReady else {
                 throw NSError(
@@ -152,6 +256,18 @@ final class VoiceEngine: NSObject {
                 playbackConnected = true
             }
 
+            playerNode.stop()
+            playerNode.reset()
+            stateLock.lock()
+            playbackGeneration &+= 1
+            scheduledPlaybackFrames = 0
+            txFrames = 0
+            rxFrames = 0
+            droppedRx = 0
+            invalidRx = 0
+            pcmAccumulator.removeAll(keepingCapacity: true)
+            stateLock.unlock()
+
             playerNode.volume = 1.0
             audioEngine.mainMixerNode.outputVolume = 1.0
 
@@ -169,82 +285,162 @@ final class VoiceEngine: NSObject {
                 self?.processPCM(buffer)
             }
 
-            txFrames = 0
-            rxFrames = 0
-            droppedRx = 0
-            invalidRx = 0
-            pcmAccumulator.removeAll(keepingCapacity: true)
+            stateLock.lock()
+            isRunning = true
+            let generation = sessionGeneration
+            stateLock.unlock()
 
             // Mark running before engine start so the first callback cannot be
             // rejected solely because the engine is transitioning to running.
-            isRunning = true
             audioEngine.prepare()
-            NSLog("[CALLSHARE_AUDIO_R1] engine prepared; isRunning=\\(audioEngine.isRunning)")
+            NSLog("[CALLSHARE_AUDIO_R1] engine prepared; engineRunning=\(audioEngine.isRunning)")
             try audioEngine.start()
-            NSLog("[CALLSHARE_AUDIO_R1] engine.start SUCCESS isRunning=\\(audioEngine.isRunning)")
+            NSLog("[CALLSHARE_AUDIO_R1] engine.start SUCCESS isRunning=\(audioEngine.isRunning)")
             playerNode.play()
-            NSLog("[CALLSHARE_AUDIO_R1] playerNode.play isPlaying=\\(playerNode.isPlaying)")
-            NSLog("[CALLSHARE_AUDIO_R1] output format=\\(audioEngine.outputNode.outputFormat(forBus: 0))")
-            NSLog("[CALLSHARE_AUDIO_R1] mixer output format=\\(audioEngine.mainMixerNode.outputFormat(forBus: 0))")
-            NSLog("[J7BRIDGE_DIAG] VoiceEngine OPEN OK")
+            NSLog("[CALLSHARE_AUDIO_R1] playerNode.play isPlaying=\(playerNode.isPlaying)")
+            NSLog("[CALLSHARE_AUDIO_R1] output format=\(audioEngine.outputNode.outputFormat(forBus: 0))")
+            NSLog("[CALLSHARE_AUDIO_R1] mixer output format=\(audioEngine.mainMixerNode.outputFormat(forBus: 0))")
 
             reportStatus(
                 String(
-                    format: "OPEN OK / mic %.0f Hz %dch -> AMR-NB 8k / speaker=%@",
+                    format: "STARTED / mic %.0f Hz %dch -> AMR-NB 8k / speaker=%@",
                     hardwareFormat.sampleRate,
                     hardwareFormat.channelCount,
                     useSpeaker ? "YES" : "NO"
                 )
             )
+
+            // Drain only the bounded RX queue that belongs to this session.
+            rxQueue.async { [weak self] in
+                self?.drainPendingRXFrames(generation: generation)
+            }
         } catch {
+            stateLock.lock()
             isRunning = false
+            stateLock.unlock()
             inputRemoveTapSafely()
             audioEngine.stop()
+            audioEngine.reset()
             playerNode.stop()
+            playerNode.reset()
             converter = nil
             reportStatus("ERROR AudioEngine: \(error.localizedDescription)")
         }
     }
 
+    /// Stop the audio engine without ending the GSM call session. Pending AMR
+    /// is retained (bounded) so a short CallKit audio activation gap does not
+    /// discard the beginning of the remote speech stream.
     func stop() {
-        guard isRunning || audioEngine.isRunning else { return }
-
+        stateLock.lock()
+        let shouldStop = isRunning || audioEngine.isRunning
         isRunning = false
+        playbackGeneration &+= 1
+        scheduledPlaybackFrames = 0
+        converter = nil
+        pcmAccumulator.removeAll(keepingCapacity: true)
+        stateLock.unlock()
+
+        guard shouldStop else { return }
+
         inputRemoveTapSafely()
         playerNode.stop()
         playerNode.reset()
         audioEngine.stop()
-        converter = nil
-        pcmAccumulator.removeAll(keepingCapacity: true)
+        audioEngine.reset()
         codec.reset()
         audioSessionPrepared = false
-        reportStatus("CLOSED / codec reset")
+        reportStatus("STOPPED / audio graph reset")
     }
 
-    /// Channel 3 carries one AMR-NB IETF/WFI frame. The first byte is the
-    /// AMR ToC byte and the decoder returns exactly 160 samples for speech
-    /// frames. The received speech mode is remembered so the reverse encoder
-    /// uses the same mode instead of assuming MR122 forever.
+    /// Channel 3 carries one AMR-NB IETF/WFI frame. Incoming BLE callbacks are
+    /// immediately handed to a private serial RX queue so decoding/scheduling
+    /// never blocks CoreBluetooth's main queue.
     func receiveAMR(_ packet: Data) {
         guard !packet.isEmpty else { return }
-        if rxFrames == 0 && invalidRx == 0 && droppedRx == 0 { reportStatus("[AMR] RECEIVE ENTRY len=\(packet.count)") }
 
-        guard isRunning else {
-            droppedRx += 1
-            if droppedRx == 1 || droppedRx % 25 == 0 {
-                reportStatus("[AMR] RX dropped while voice engine stopped len=\(packet.count)")
-            }
+        stateLock.lock()
+        guard acceptsRX else {
+            stateLock.unlock()
             return
         }
 
-        if rxFrames == 0 || rxFrames % 25 == 0 {
-            NSLog("[J7BRIDGE_DIAG] receiveAMR len=\(packet.count)")
+        let generation = sessionGeneration
+        if rxWorkQueue.count >= maxRXWorkFrames {
+            rxWorkQueue.removeFirst()
+            droppedRx += 1
+            let dropped = droppedRx
+            if dropped == 1 || dropped % 25 == 0 {
+                stateLock.unlock()
+                reportStatus("[AMR] RX work queue overflow; dropped oldest frame")
+            } else {
+                stateLock.unlock()
+            }
+        } else {
+            stateLock.unlock()
         }
 
+        stateLock.lock()
+        rxWorkQueue.append((packet, generation))
+        let shouldStartWorker = !rxWorkerScheduled
+        if shouldStartWorker { rxWorkerScheduled = true }
+        stateLock.unlock()
+
+        if shouldStartWorker {
+            rxQueue.async { [weak self] in
+                self?.drainRXWorkQueue()
+            }
+        }
+    }
+
+    private func drainRXWorkQueue() {
+        while true {
+            stateLock.lock()
+            guard !rxWorkQueue.isEmpty else {
+                rxWorkerScheduled = false
+                stateLock.unlock()
+                return
+            }
+            let item = rxWorkQueue.removeFirst()
+            stateLock.unlock()
+
+            consumeAMR(item.0, generation: item.1)
+        }
+    }
+
+    private func consumeAMR(_ packet: Data, generation: UInt64) {
+        stateLock.lock()
+        guard acceptsRX, sessionGeneration == generation else {
+            stateLock.unlock()
+            return
+        }
+
+        if !isRunning {
+            if pendingRXFrames.count >= maxPendingRXFrames {
+                pendingRXFrames.removeFirst()
+                droppedRx += 1
+                if droppedRx == 1 || droppedRx % 25 == 0 {
+                    reportStatus("[AMR] RX queue overflow; dropped oldest frame")
+                }
+            }
+            pendingRXFrames.append(packet)
+            let depth = pendingRXFrames.count
+            stateLock.unlock()
+
+            if depth == 1 {
+                reportStatus("[AMR] RX queued while engine stopped count=1 len=\(packet.count)")
+            }
+            return
+        }
+        stateLock.unlock()
+
         guard let frameInfo = codec.validateAndLearnMode(packet) else {
+            stateLock.lock()
             invalidRx += 1
-            if invalidRx == 1 || invalidRx % 25 == 0 {
-                reportStatus("[AMR] RX INVALID frame #\(invalidRx) len=\(packet.count)")
+            let count = invalidRx
+            stateLock.unlock()
+            if count == 1 || count % 25 == 0 {
+                reportStatus("[AMR] RX INVALID frame #\(count) len=\(packet.count)")
             }
             return
         }
@@ -254,28 +450,36 @@ final class VoiceEngine: NSObject {
             return
         }
 
-        let minSample = pcm.min() ?? 0
-        let maxSample = pcm.max() ?? 0
-        let nonZero = pcm.reduce(into: 0) { count, sample in
-            if sample != 0 { count += 1 }
-        }
-
-        if rxFrames == 0 || rxFrames % 25 == 0 {
-            reportStatus(
-                "[AMR] PCM CHECK rx=\(rxFrames + 1) min=\(minSample) max=\(maxSample) nonZero=\(nonZero)/160"
-            )
-                NSLog("[J7BRIDGE_DIAG] PCM min=\(minSample) max=\(maxSample) nonZero=\(nonZero)")
-        }
-
+        stateLock.lock()
         rxFrames += 1
-        if rxFrames == 1 || rxFrames % 25 == 0 {
+        let frameNumber = rxFrames
+        stateLock.unlock()
+
+        if frameNumber == 1 || frameNumber % 25 == 0 {
             reportStatus(
-                "[AMR] RX frame #\(rxFrames) len=\(packet.count) ft=\(frameInfo.frameType) " +
-                "mode=\(frameInfo.encoderMode) -> PCM160"
+                "[AMR] RX frame #\(frameNumber) len=\(packet.count) ft=\(frameInfo.frameType) mode=\(frameInfo.encoderMode) -> PCM160"
             )
         }
 
-        schedulePlayback(pcm)
+        schedulePlayback(pcm, generation: generation)
+    }
+
+    private func drainPendingRXFrames(generation: UInt64) {
+        stateLock.lock()
+        guard acceptsRX, sessionGeneration == generation, isRunning else {
+            stateLock.unlock()
+            return
+        }
+        let queued = pendingRXFrames
+        pendingRXFrames.removeAll(keepingCapacity: true)
+        stateLock.unlock()
+
+        guard !queued.isEmpty else { return }
+        reportStatus("[AMR] RX queue drain count=\(queued.count)")
+
+        for packet in queued {
+            consumeAMR(packet, generation: generation)
+        }
     }
 
     private func sessionOptions() -> AVAudioSession.CategoryOptions {
@@ -295,7 +499,7 @@ final class VoiceEngine: NSObject {
             )
             audioSessionPrepared = true
         } catch {
-            NSLog("[CALLSHARE_AUDIO_R1] setCategory ERROR \\(error)")
+            NSLog("[CALLSHARE_AUDIO_R1] setCategory ERROR \(error)")
         }
     }
 
@@ -304,7 +508,12 @@ final class VoiceEngine: NSObject {
     }
 
     private func processPCM(_ buffer: AVAudioPCMBuffer) {
-        guard isRunning, let converter else { return }
+        stateLock.lock()
+        let running = isRunning
+        let activeConverter = converter
+        stateLock.unlock()
+
+        guard running, let activeConverter else { return }
 
         let ratio = pcm8kFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 64)
@@ -320,7 +529,7 @@ final class VoiceEngine: NSObject {
         var error: NSError?
         var supplied = false
 
-        converter.convert(to: output, error: &error) { _, status in
+        activeConverter.convert(to: output, error: &error) { _, status in
             if supplied {
                 status.pointee = .noDataNow
                 return nil
@@ -345,6 +554,9 @@ final class VoiceEngine: NSObject {
             return
         }
 
+        var framesToEncode: [[Int16]] = []
+
+        stateLock.lock()
         pcmAccumulator.append(
             contentsOf: UnsafeBufferPointer(
                 start: pointer,
@@ -353,39 +565,88 @@ final class VoiceEngine: NSObject {
         )
 
         while pcmAccumulator.count >= 160 {
-            let frame = Array(pcmAccumulator.prefix(160))
+            framesToEncode.append(Array(pcmAccumulator.prefix(160)))
             pcmAccumulator.removeFirst(160)
+        }
+        stateLock.unlock()
 
-            guard !muted else { continue }
+        for frame in framesToEncode {
+            stateLock.lock()
+            let currentlyMuted = muted
+            let generation = sessionGeneration
+            let accepting = acceptsRX
+            stateLock.unlock()
+            guard accepting else { continue }
+            guard !currentlyMuted else { continue }
+
             guard let amr = codec.encode160(frame) else {
                 reportStatus("[AMR] TX ENCODE FAILED mode=\(codec.encoderMode)")
                 continue
             }
 
+            stateLock.lock()
             txFrames += 1
-            if txFrames == 1 || txFrames % 25 == 0 {
-                reportStatus("[AMR] TX frame #\(txFrames) len=\(amr.count) mode=\(codec.encoderMode)")
+            let frameNumber = txFrames
+            stateLock.unlock()
+
+            if frameNumber == 1 || frameNumber % 25 == 0 {
+                reportStatus("[AMR] TX frame #\(frameNumber) len=\(amr.count) mode=\(codec.encoderMode)")
             }
 
             // CoreBluetooth work never runs directly on the audio callback.
+            // Fence queued main-queue work by call generation so a packet from
+            // call N cannot leak into call N+1 after a fast hangup/re-ring.
             let callback = onAMRPacket
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let stillCurrent = self.acceptsRX && self.sessionGeneration == generation
+                self.stateLock.unlock()
+                guard stillCurrent else { return }
                 callback?(amr)
             }
         }
     }
 
-    private func schedulePlayback(_ pcm: [Int16]) {
+    private func schedulePlayback(_ pcm: [Int16], generation: UInt64) {
         guard pcm.count == 160 else { return }
-        if !audioEngine.isRunning {
-            reportStatus("[AUDIO] PLAYBACK DROP engineRunning=NO")
+
+        var resetBacklog = false
+        var playbackToken: UInt64 = 0
+
+        stateLock.lock()
+        guard acceptsRX, sessionGeneration == generation, isRunning, audioEngine.isRunning else {
+            stateLock.unlock()
             return
+        }
+
+        if scheduledPlaybackFrames >= maxScheduledPlaybackFrames {
+            // Drop the old scheduled tail and keep only the newest live frame.
+            playbackGeneration &+= 1
+            scheduledPlaybackFrames = 0
+            resetBacklog = true
+        }
+
+        playbackToken = playbackGeneration
+        scheduledPlaybackFrames += 1
+        stateLock.unlock()
+
+        if resetBacklog {
+            playerNode.stop()
+            playerNode.reset()
+            playerNode.play()
+            reportStatus("[AUDIO] playback backlog reset to preserve low latency")
         }
 
         guard let buffer = AVAudioPCMBuffer(
             pcmFormat: pcm8kFormat,
             frameCapacity: 160
         ) else {
+            stateLock.lock()
+            if playbackToken == playbackGeneration, scheduledPlaybackFrames > 0 {
+                scheduledPlaybackFrames -= 1
+            }
+            stateLock.unlock()
             reportStatus("[AUDIO] could not allocate playback buffer")
             return
         }
@@ -393,6 +654,11 @@ final class VoiceEngine: NSObject {
         buffer.frameLength = 160
 
         guard let channel = buffer.int16ChannelData?[0] else {
+            stateLock.lock()
+            if playbackToken == playbackGeneration, scheduledPlaybackFrames > 0 {
+                scheduledPlaybackFrames -= 1
+            }
+            stateLock.unlock()
             reportStatus("[AUDIO] playback buffer has no Int16 channel")
             return
         }
@@ -402,13 +668,21 @@ final class VoiceEngine: NSObject {
             channel.assign(from: base, count: pcm.count)
         }
 
-        playerNode.scheduleBuffer(buffer, completionHandler: nil)
-        NSLog("[CALLSHARE_AUDIO_R1] playback scheduled frames=160 engineRunning=\\(audioEngine.isRunning) playerPlaying=\\(playerNode.isPlaying)")
+        playerNode.scheduleBuffer(buffer) { [weak self] in
+            self?.playbackBufferConsumed(generation: playbackToken)
+        }
 
         if !playerNode.isPlaying {
             playerNode.play()
-            NSLog("[CALLSHARE_AUDIO_R1] playerNode restarted isPlaying=\\(playerNode.isPlaying)")
         }
+    }
+
+    private func playbackBufferConsumed(generation: UInt64) {
+        stateLock.lock()
+        if generation == playbackGeneration, scheduledPlaybackFrames > 0 {
+            scheduledPlaybackFrames -= 1
+        }
+        stateLock.unlock()
     }
 
     private func routeDescription() -> String {
