@@ -1,3 +1,7 @@
+# R3 follow-up
+
+R3 targets the remaining CallKit/AVAudioSession start-order race identified during real-device testing. See `CALLSHARE_AUDIO_SESSION_R3_SURGERY.md`. The GATT and Android transport remain unchanged.
+
 # CALLSHARE iOS — Call Session / Audio Lifecycle Fix R2
 
 ## Deep analysis result

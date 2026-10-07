@@ -50,6 +50,9 @@ final class AppModel: ObservableObject {
     private var currentContactName: String?
     private var callAudioActive = false
     private var remoteVoiceOpen = false
+    // R3: K7 voice must not be opened until CallKit audio is actually active
+    // and the local VoiceEngine has started successfully.
+    private var voiceOpenRequested = false
 
     /// Monotonically increasing CallShare session token. Every new call gets a
     /// new token; asynchronous CallKit completions capture their token so an
@@ -242,7 +245,9 @@ final class AppModel: ObservableObject {
             callKit.fulfillAnswerIfNeeded()
             beginCallIfNeeded(direction: currentDirection ?? .incoming)
             remoteVoiceOpen = false
-            ble.sendVoiceOpen()
+            // R3: DO NOT open the remote GSM voice stream yet. CallKit audio
+            // activation and the local VoiceEngine must win the race first.
+            // maybeStartVoice() will start the engine, then request VOICE_OPEN.
             maybeStartVoice()
 
         case K7Protocol.evtReceiveCallEnd:
@@ -258,7 +263,9 @@ final class AppModel: ObservableObject {
                 return
             }
             remoteVoiceOpen = true
-            log("[VOICE] OPEN EVENT")
+            log("[VOICE] OPEN EVENT / K7 ACK")
+            // VoiceEngine should already be running because R3 sends
+            // VOICE_OPEN only after CallKit audio activation.
             maybeStartVoice()
 
         case K7Protocol.evtVoiceClose:
@@ -321,6 +328,7 @@ final class AppModel: ObservableObject {
         callStartedAt = Date()
         callAudioActive = false
         remoteVoiceOpen = false
+        voiceOpenRequested = false
         isMuted = false
         callStatus = "RINGING"
         log("[CALL] SESSION BEGIN #\(sessionID) INCOMING \(name.map { "\($0) / " } ?? "")\(incomingNumber)")
@@ -369,6 +377,7 @@ final class AppModel: ObservableObject {
         callStartedAt = Date()
         callAudioActive = false
         remoteVoiceOpen = false
+        voiceOpenRequested = false
         isMuted = false
         callStatus = "DIALING"
 
@@ -402,18 +411,35 @@ final class AppModel: ObservableObject {
             return
         }
 
-        guard remoteVoiceOpen else {
-            log("[VOICE] WAIT remote VOICE_OPEN")
-            return
-        }
-
+        // R3: CallKit audio activation is the hard local readiness gate.
+        // We intentionally do NOT wait for K7 VOICE_OPEN here because that
+        // event is the acknowledgement of our VOICE_OPEN request. Waiting
+        // for both would create a circular dependency:
+        //   local audio -> VOICE_OPEN -> K7 -> VOICE_OPEN event.
         guard callAudioActive else {
             log("[VOICE] WAIT CallKit audio activation")
             return
         }
 
-        log("[VOICE] START gate satisfied -> VoiceEngine.start()")
-        voice.start()
+        if !voiceOpenRequested {
+            log("[VOICE] AUDIO READY -> VoiceEngine.start()")
+            guard voice.start() else {
+                log("[VOICE] START FAILED -> VOICE_OPEN not sent")
+                return
+            }
+
+            // R3: only after the iPhone audio graph is genuinely running do
+            // we tell K7 to begin the remote GSM voice stream.
+            voiceOpenRequested = true
+            log("[VOICE] ENGINE READY -> K7 VOICE_OPEN")
+            ble.sendVoiceOpen()
+        } else {
+            // Already requested. This path handles a late K7 VOICE_OPEN
+            // acknowledgement without restarting the audio engine.
+            if !remoteVoiceOpen {
+                log("[VOICE] waiting for K7 VOICE_OPEN ACK")
+            }
+        }
     }
 
     private func endFromCallKit() {
@@ -455,6 +481,7 @@ final class AppModel: ObservableObject {
         // prevents uplink AMR from one call being delivered into the next.
         ble.sendVoiceClose()
         remoteVoiceOpen = false
+        voiceOpenRequested = false
         callAudioActive = false
         voice.stop()
         voice.endCallSession()
@@ -490,6 +517,7 @@ final class AppModel: ObservableObject {
         if sendHangup { ble.sendHangup() }
         ble.sendVoiceClose()
         remoteVoiceOpen = false
+        voiceOpenRequested = false
         callAudioActive = false
         voice.stop()
         voice.endCallSession()

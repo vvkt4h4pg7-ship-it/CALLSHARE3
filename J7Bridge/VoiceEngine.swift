@@ -97,8 +97,20 @@ final class VoiceEngine: NSObject {
 
     func setSpeakerDefault(_ enabled: Bool) {
         useSpeaker = enabled
-        if isRunning {
-            applySessionCategory()
+
+        // R3: changing speaker route must NOT rebuild/deactivate the CallKit
+        // audio session while a live call is running. Use the AVAudioSession
+        // port override only; the microphone/input side stays owned by the
+        // same active PlayAndRecord session.
+        guard isRunning else { return }
+
+        do {
+            try audioSession.overrideOutputAudioPort(enabled ? .speaker : .none)
+            reportStatus("[AUDIO] speaker route = \(enabled ? "SPEAKER" : "DEFAULT")")
+            NSLog("[CALLSHARE_AUDIO_R3] overrideOutputAudioPort=\(enabled ? "speaker" : "none") route=\(routeDescription())")
+        } catch {
+            reportStatus("[AUDIO] speaker route ERROR: \(error.localizedDescription)")
+            NSLog("[CALLSHARE_AUDIO_R3] overrideOutputAudioPort ERROR \(error)")
         }
     }
 
@@ -198,7 +210,8 @@ final class VoiceEngine: NSObject {
     /// CallKit activates AVAudioSession first. This method then opens the
     /// microphone and starts the playback graph using the same 8 kHz mono
     /// PCM boundary used by AMR-NB.
-    func start() {
+    @discardableResult
+    func start() -> Bool {
         stateLock.lock()
         let runningAndEngineAlive = isRunning && audioEngine.isRunning
         if isRunning && !audioEngine.isRunning {
@@ -206,7 +219,7 @@ final class VoiceEngine: NSObject {
         }
         stateLock.unlock()
 
-        guard !runningAndEngineAlive else { return }
+        guard !runningAndEngineAlive else { return true }
 
         NSLog("[J7BRIDGE_DIAG] VoiceEngine.start ENTER")
 
@@ -310,10 +323,13 @@ final class VoiceEngine: NSObject {
                 )
             )
 
-            // Drain only the bounded RX queue that belongs to this session.
+            // R3 hard-flush: any AMR that arrived before the audio graph was
+            // ready is stale by definition. Do not replay it and introduce
+            // artificial latency. The live stream begins after VOICE_OPEN.
             rxQueue.async { [weak self] in
-                self?.drainPendingRXFrames(generation: generation)
+                self?.flushPreStartRXFrames(generation: generation)
             }
+            return true
         } catch {
             stateLock.lock()
             isRunning = false
@@ -325,6 +341,7 @@ final class VoiceEngine: NSObject {
             playerNode.reset()
             converter = nil
             reportStatus("ERROR AudioEngine: \(error.localizedDescription)")
+            return false
         }
     }
 
@@ -464,23 +481,21 @@ final class VoiceEngine: NSObject {
         schedulePlayback(pcm, generation: generation)
     }
 
-    private func drainPendingRXFrames(generation: UInt64) {
+    private func flushPreStartRXFrames(generation: UInt64) {
         stateLock.lock()
-        guard acceptsRX, sessionGeneration == generation, isRunning else {
+        guard sessionGeneration == generation else {
             stateLock.unlock()
             return
         }
-        let queued = pendingRXFrames
+        let count = pendingRXFrames.count
         pendingRXFrames.removeAll(keepingCapacity: true)
         stateLock.unlock()
 
-        guard !queued.isEmpty else { return }
-        reportStatus("[AMR] RX queue drain count=\(queued.count)")
-
-        for packet in queued {
-            consumeAMR(packet, generation: generation)
+        if count > 0 {
+            reportStatus("[AMR] PRE-START FLUSH dropped \(count) stale frame(s)")
         }
     }
+
 
     private func sessionOptions() -> AVAudioSession.CategoryOptions {
         var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
