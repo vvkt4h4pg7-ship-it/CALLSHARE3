@@ -1,0 +1,369 @@
+--- a/AppModel.swift
++++ b/AppModel.swift
+@@ -244,6 +244,14 @@
+             log("[CALL] ANSWER EVENT / ACTIVE")
+             callKit.fulfillAnswerIfNeeded()
+             beginCallIfNeeded(direction: currentDirection ?? .incoming)
++
++            // Outgoing calls also need an explicit connected transition so
++            // CallKit can activate the shared audio session.
++            if currentDirection == .outgoing {
++                callKit.reportOutgoingConnected()
++                log("[CALLKIT] OUTGOING connected -> audio activation armed")
++            }
++
+             remoteVoiceOpen = false
+             // R3: DO NOT open the remote GSM voice stream yet. CallKit audio
+             // activation and the local VoiceEngine must win the race first.
+@@ -411,34 +419,33 @@
+             return
+         }
+ 
+-        // R3: CallKit audio activation is the hard local readiness gate.
+-        // We intentionally do NOT wait for K7 VOICE_OPEN here because that
+-        // event is the acknowledgement of our VOICE_OPEN request. Waiting
+-        // for both would create a circular dependency:
+-        //   local audio -> VOICE_OPEN -> K7 -> VOICE_OPEN event.
++        // CallKit activation is the hard local readiness gate.
+         guard callAudioActive else {
+             log("[VOICE] WAIT CallKit audio activation")
+             return
+         }
+ 
+-        if !voiceOpenRequested {
++        // VOICE_OPEN is remote state; it is NOT a substitute for the local
++        // engine state. A transient CallKit route/deactivation can leave
++        // voiceOpenRequested=true while the local graph has stopped.
++        if !voice.isActuallyRunning {
+             log("[VOICE] AUDIO READY -> VoiceEngine.start()")
+             guard voice.start() else {
+                 log("[VOICE] START FAILED -> VOICE_OPEN not sent")
+                 return
+             }
+-
+-            // R3: only after the iPhone audio graph is genuinely running do
+-            // we tell K7 to begin the remote GSM voice stream.
++            log("[VOICE] ENGINE RUNNING")
++        }
++
++        if !voiceOpenRequested {
+             voiceOpenRequested = true
+             log("[VOICE] ENGINE READY -> K7 VOICE_OPEN")
+             ble.sendVoiceOpen()
+-        } else {
+-            // Already requested. This path handles a late K7 VOICE_OPEN
+-            // acknowledgement without restarting the audio engine.
+-            if !remoteVoiceOpen {
+-                log("[VOICE] waiting for K7 VOICE_OPEN ACK")
+-            }
++        } else if !remoteVoiceOpen {
++            // Re-open the K7 side after a transient remote close without
++            // rebuilding the iPhone audio graph.
++            log("[VOICE] ENGINE RUNNING -> re-request K7 VOICE_OPEN")
++            ble.sendVoiceOpen()
+         }
+     }
+ 
+@@ -473,13 +480,14 @@
+         let direction = historyDirectionOverride ?? currentDirection ?? .outgoing
+         let wasRinging = callStatus == "RINGING"
+ 
++        ble.sendVoiceClose()
++
+         if sendHangup {
+             ble.sendHangup()
+         }
+ 
+         // Always terminate voice transport and clear pending TX frames. This
+         // prevents uplink AMR from one call being delivered into the next.
+-        ble.sendVoiceClose()
+         remoteVoiceOpen = false
+         voiceOpenRequested = false
+         callAudioActive = false
+@@ -514,8 +522,8 @@
+             return
+         }
+ 
++        ble.sendVoiceClose()
+         if sendHangup { ble.sendHangup() }
+-        ble.sendVoiceClose()
+         remoteVoiceOpen = false
+         voiceOpenRequested = false
+         callAudioActive = false
+--- a/VoiceEngine.swift
++++ b/VoiceEngine.swift
+@@ -46,6 +46,15 @@
+ 
+     var onAMRPacket: ((Data) -> Void)?
+     var onStatus: ((String) -> Void)?
++
++    /// True only when the local audio graph is actually running. This is
++    /// intentionally separate from VOICE_OPEN state: CallKit may deactivate
++    /// and later reactivate the audio session while the same call UUID lives.
++    var isActuallyRunning: Bool {
++        stateLock.lock()
++        defer { stateLock.unlock() }
++        return isRunning && audioEngine.isRunning
++    }
+ 
+     private let codec = AMRCodecAdapter()
+ 
+@@ -59,16 +68,24 @@
+     )
+     private let stateLock = NSLock()
+ 
+-    private var pendingRXFrames: [Data] = []
+-    private let maxPendingRXFrames = 25       // 500 ms @ 20 ms/frame
+-
+-    // This is a second bounded queue used only to prevent GCD itself from
+-    // accumulating thousands of RX blocks when AMR decode is temporarily
+-    // slower than the 20 ms packet arrival rate. Oldest frames are discarded
+-    // so latency stays bounded instead of turning into delayed speech.
++    // Pre-start RX is deliberately NOT queued. Live telephony audio must never
++    // replay old speech after CallKit/audio activation catches up.
++    // This is separate from the bounded worker queue below.
++
++    // This queue only serializes AMR decode work off CoreBluetooth. It is bounded
++    // to a few hundred milliseconds and oldest frames are discarded under load.
+     private var rxWorkQueue: [(Data, UInt64)] = []
+     private let maxRXWorkFrames = 20         // 400 ms @ 20 ms/frame
+     private var rxWorkerScheduled = false
++
++    // Voice TX used to DispatchQueue.main.async once per 20 ms frame. If the
++    // main queue was busy during CallKit activation/UI work, hundreds of
++    // closures could accumulate and later send old microphone speech to J7.
++    // Keep at most ONE pending frame and always replace it with the newest.
++    private let txDispatchLock = NSLock()
++    private var pendingTXFrame: (Data, UInt64)?
++    private var txDispatchScheduled = false
++    private var txDispatchWorkItem: DispatchWorkItem?
+ 
+     private var acceptsRX = false
+     private var sessionGeneration: UInt64 = 0
+@@ -130,10 +147,9 @@
+ 
+         stateLock.lock()
+         sessionGeneration &+= 1
+-        acceptsRX = true
++        acceptsRX = false
+         isRunning = false
+         converter = nil
+-        pendingRXFrames.removeAll(keepingCapacity: true)
+         rxWorkQueue.removeAll(keepingCapacity: true)
+         rxWorkerScheduled = false
+         playbackGeneration &+= 1
+@@ -145,6 +161,7 @@
+         pcmAccumulator.removeAll(keepingCapacity: true)
+         stateLock.unlock()
+ 
++        cancelPendingTX()
+         playerNode.stop()
+         playerNode.reset()
+         audioEngine.stop()
+@@ -163,12 +180,14 @@
+         acceptsRX = false
+         isRunning = false
+         converter = nil
+-        pendingRXFrames.removeAll(keepingCapacity: true)
+         rxWorkQueue.removeAll(keepingCapacity: true)
+         playbackGeneration &+= 1
+         scheduledPlaybackFrames = 0
+         pcmAccumulator.removeAll(keepingCapacity: true)
+         stateLock.unlock()
++
++        // Invalidate the TX dispatch before tearing down the player graph.
++        cancelPendingTX()
+ 
+         // Wait for an already-running RX decode block to observe the new
+         // generation before tearing down the player graph.
+@@ -309,6 +328,22 @@
+             NSLog("[CALLSHARE_AUDIO_R1] engine prepared; engineRunning=\(audioEngine.isRunning)")
+             try audioEngine.start()
+             NSLog("[CALLSHARE_AUDIO_R1] engine.start SUCCESS isRunning=\(audioEngine.isRunning)")
++
++            // Apply the output route AFTER CallKit activation, without
++            // deactivating/re-activating the shared call session. This fixes the
++            // incomplete R3 speaker change where .defaultToSpeaker alone could
++            // leave playback on the receiver route.
++            do {
++                try audioSession.overrideOutputAudioPort(useSpeaker ? .speaker : .none)
++                NSLog("[CALLSHARE_AUDIO_R4] output override=\(useSpeaker ? "speaker" : "none") route=\(routeDescription())")
++            } catch {
++                NSLog("[CALLSHARE_AUDIO_R4] output override deferred ERROR=\(error.localizedDescription)")
++            }
++
++            stateLock.lock()
++            acceptsRX = true
++            stateLock.unlock()
++
+             playerNode.play()
+             NSLog("[CALLSHARE_AUDIO_R1] playerNode.play isPlaying=\(playerNode.isPlaying)")
+             NSLog("[CALLSHARE_AUDIO_R1] output format=\(audioEngine.outputNode.outputFormat(forBus: 0))")
+@@ -323,12 +358,9 @@
+                 )
+             )
+ 
+-            // R3 hard-flush: any AMR that arrived before the audio graph was
+-            // ready is stale by definition. Do not replay it and introduce
+-            // artificial latency. The live stream begins after VOICE_OPEN.
+-            rxQueue.async { [weak self] in
+-                self?.flushPreStartRXFrames(generation: generation)
+-            }
++            // No pre-start RX queue exists in R4. The live stream begins only
++            // after this engine is running and VOICE_OPEN is sent by AppModel.
++            _ = generation
+             return true
+         } catch {
+             stateLock.lock()
+@@ -340,6 +372,7 @@
+             playerNode.stop()
+             playerNode.reset()
+             converter = nil
++            cancelPendingTX()
+             reportStatus("ERROR AudioEngine: \(error.localizedDescription)")
+             return false
+         }
+@@ -481,22 +514,6 @@
+         schedulePlayback(pcm, generation: generation)
+     }
+ 
+-    private func flushPreStartRXFrames(generation: UInt64) {
+-        stateLock.lock()
+-        guard sessionGeneration == generation else {
+-            stateLock.unlock()
+-            return
+-        }
+-        let count = pendingRXFrames.count
+-        pendingRXFrames.removeAll(keepingCapacity: true)
+-        stateLock.unlock()
+-
+-        if count > 0 {
+-            reportStatus("[AMR] PRE-START FLUSH dropped \(count) stale frame(s)")
+-        }
+-    }
+-
+-
+     private func sessionOptions() -> AVAudioSession.CategoryOptions {
+         var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
+         if useSpeaker {
+@@ -608,19 +625,81 @@
+                 reportStatus("[AMR] TX frame #\(frameNumber) len=\(amr.count) mode=\(codec.encoderMode)")
+             }
+ 
+-            // CoreBluetooth work never runs directly on the audio callback.
+-            // Fence queued main-queue work by call generation so a packet from
+-            // call N cannot leak into call N+1 after a fast hangup/re-ring.
+-            let callback = onAMRPacket
+-            DispatchQueue.main.async { [weak self] in
+-                guard let self else { return }
+-                self.stateLock.lock()
+-                let stillCurrent = self.acceptsRX && self.sessionGeneration == generation
+-                self.stateLock.unlock()
+-                guard stillCurrent else { return }
+-                callback?(amr)
+-            }
+-        }
++            // CoreBluetooth writes stay on the main queue for BLEManager state
++            // safety, but R4 never schedules one main-queue closure per audio
++            // frame. The coalescer keeps at most ONE pending microphone frame,
++            // replacing stale audio with the newest frame.
++            enqueueTXFrame(amr, generation: generation)
++        }
++    }
++
++    private func enqueueTXFrame(_ amr: Data, generation: UInt64) {
++        txDispatchLock.lock()
++        pendingTXFrame = (amr, generation)
++
++        if txDispatchScheduled {
++            txDispatchLock.unlock()
++            return
++        }
++
++        txDispatchScheduled = true
++        let work = DispatchWorkItem { [weak self] in
++            self?.drainTXFrameOnMain()
++        }
++        txDispatchWorkItem = work
++        txDispatchLock.unlock()
++
++        DispatchQueue.main.async(execute: work)
++    }
++
++    private func drainTXFrameOnMain() {
++        txDispatchLock.lock()
++        let item = pendingTXFrame
++        pendingTXFrame = nil
++        txDispatchLock.unlock()
++
++        if let item {
++            let (frame, generation) = item
++
++            stateLock.lock()
++            let stillCurrent = acceptsRX && sessionGeneration == generation
++            stateLock.unlock()
++
++            txDispatchLock.lock()
++            let cancelled = txDispatchWorkItem?.isCancelled ?? false
++            txDispatchLock.unlock()
++
++            if stillCurrent && !cancelled {
++                onAMRPacket?(frame)
++            }
++        }
++
++        txDispatchLock.lock()
++        let needsAnotherDrain = pendingTXFrame != nil
++        if !needsAnotherDrain {
++            txDispatchScheduled = false
++            txDispatchWorkItem = nil
++        }
++        txDispatchLock.unlock()
++
++        if needsAnotherDrain {
++            let work = DispatchWorkItem { [weak self] in
++                self?.drainTXFrameOnMain()
++            }
++            txDispatchLock.lock()
++            txDispatchWorkItem = work
++            txDispatchLock.unlock()
++            DispatchQueue.main.async(execute: work)
++        }
++    }
++
++    private func cancelPendingTX() {
++        txDispatchLock.lock()
++        txDispatchWorkItem?.cancel()
++        txDispatchWorkItem = nil
++        pendingTXFrame = nil
++        txDispatchScheduled = false
++        txDispatchLock.unlock()
+     }
+ 
+     private func schedulePlayback(_ pcm: [Int16], generation: UInt64) {
+--- a/CallKitManager.swift
++++ b/CallKitManager.swift
+@@ -213,6 +213,14 @@
+         }
+ 
+         answerAction = action
++
++        // Prepare the CallKit-owned AVAudioSession even when K7's 0x05 answer
++        // acknowledgement raced ahead of CXAnswerCallAction. R3 skipped this
++        // preparation in that race, leaving the next activation dependent on
++        // whatever category/route the system happened to have at that moment.
++        onPrepareAudio?()
++        onLog?("[CALLSHARE_AUDIO_R4] PREPARE before CallKit activation (answer)")
++
+         if answerConfirmed {
+             answerAction = nil
+             answerConfirmed = false
+@@ -221,8 +229,6 @@
+             return
+         }
+ 
+-        onPrepareAudio?()
+-        onLog?("[CALLSHARE_AUDIO_R1] PREPARE before CallKit activation (answer)")
+         onLog?("[CALLKIT] ANSWER action -> BLE 05; waiting for K7 05")
+         onAnswer?()
+     }

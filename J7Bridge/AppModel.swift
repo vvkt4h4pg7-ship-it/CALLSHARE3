@@ -244,6 +244,14 @@ final class AppModel: ObservableObject {
             log("[CALL] ANSWER EVENT / ACTIVE")
             callKit.fulfillAnswerIfNeeded()
             beginCallIfNeeded(direction: currentDirection ?? .incoming)
+
+            // Outgoing calls also need an explicit connected transition so
+            // CallKit can activate the shared audio session.
+            if currentDirection == .outgoing {
+                callKit.reportOutgoingConnected()
+                log("[CALLKIT] OUTGOING connected -> audio activation armed")
+            }
+
             remoteVoiceOpen = false
             // R3: DO NOT open the remote GSM voice stream yet. CallKit audio
             // activation and the local VoiceEngine must win the race first.
@@ -411,34 +419,33 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // R3: CallKit audio activation is the hard local readiness gate.
-        // We intentionally do NOT wait for K7 VOICE_OPEN here because that
-        // event is the acknowledgement of our VOICE_OPEN request. Waiting
-        // for both would create a circular dependency:
-        //   local audio -> VOICE_OPEN -> K7 -> VOICE_OPEN event.
+        // CallKit activation is the hard local readiness gate.
         guard callAudioActive else {
             log("[VOICE] WAIT CallKit audio activation")
             return
         }
 
-        if !voiceOpenRequested {
+        // VOICE_OPEN is remote state; it is NOT a substitute for the local
+        // engine state. A transient CallKit route/deactivation can leave
+        // voiceOpenRequested=true while the local graph has stopped.
+        if !voice.isActuallyRunning {
             log("[VOICE] AUDIO READY -> VoiceEngine.start()")
             guard voice.start() else {
                 log("[VOICE] START FAILED -> VOICE_OPEN not sent")
                 return
             }
+            log("[VOICE] ENGINE RUNNING")
+        }
 
-            // R3: only after the iPhone audio graph is genuinely running do
-            // we tell K7 to begin the remote GSM voice stream.
+        if !voiceOpenRequested {
             voiceOpenRequested = true
             log("[VOICE] ENGINE READY -> K7 VOICE_OPEN")
             ble.sendVoiceOpen()
-        } else {
-            // Already requested. This path handles a late K7 VOICE_OPEN
-            // acknowledgement without restarting the audio engine.
-            if !remoteVoiceOpen {
-                log("[VOICE] waiting for K7 VOICE_OPEN ACK")
-            }
+        } else if !remoteVoiceOpen {
+            // Re-open the K7 side after a transient remote close without
+            // rebuilding the iPhone audio graph.
+            log("[VOICE] ENGINE RUNNING -> re-request K7 VOICE_OPEN")
+            ble.sendVoiceOpen()
         }
     }
 
@@ -473,13 +480,14 @@ final class AppModel: ObservableObject {
         let direction = historyDirectionOverride ?? currentDirection ?? .outgoing
         let wasRinging = callStatus == "RINGING"
 
+        ble.sendVoiceClose()
+
         if sendHangup {
             ble.sendHangup()
         }
 
         // Always terminate voice transport and clear pending TX frames. This
         // prevents uplink AMR from one call being delivered into the next.
-        ble.sendVoiceClose()
         remoteVoiceOpen = false
         voiceOpenRequested = false
         callAudioActive = false
@@ -514,8 +522,8 @@ final class AppModel: ObservableObject {
             return
         }
 
-        if sendHangup { ble.sendHangup() }
         ble.sendVoiceClose()
+        if sendHangup { ble.sendHangup() }
         remoteVoiceOpen = false
         voiceOpenRequested = false
         callAudioActive = false

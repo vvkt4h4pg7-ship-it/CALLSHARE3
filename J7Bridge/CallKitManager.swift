@@ -213,6 +213,14 @@ extension CallKitManager: CXProviderDelegate {
         }
 
         answerAction = action
+
+        // Prepare the CallKit-owned AVAudioSession even when K7's 0x05 answer
+        // acknowledgement raced ahead of CXAnswerCallAction. R3 skipped this
+        // preparation in that race, leaving the next activation dependent on
+        // whatever category/route the system happened to have at that moment.
+        onPrepareAudio?()
+        onLog?("[CALLSHARE_AUDIO_R4] PREPARE before CallKit activation (answer)")
+
         if answerConfirmed {
             answerAction = nil
             answerConfirmed = false
@@ -221,8 +229,6 @@ extension CallKitManager: CXProviderDelegate {
             return
         }
 
-        onPrepareAudio?()
-        onLog?("[CALLSHARE_AUDIO_R1] PREPARE before CallKit activation (answer)")
         onLog?("[CALLKIT] ANSWER action -> BLE 05; waiting for K7 05")
         onAnswer?()
     }
