@@ -47,6 +47,15 @@ final class VoiceEngine: NSObject {
     var onAMRPacket: ((Data) -> Void)?
     var onStatus: ((String) -> Void)?
 
+    /// True only when both the VoiceEngine state and AVAudioEngine are actually running.
+    /// AppModel uses this to avoid treating a stale `isRunning` flag as live audio.
+    var isActuallyRunning: Bool {
+        stateLock.lock()
+        let running = isRunning && audioEngine.isRunning
+        stateLock.unlock()
+        return running
+    }
+
     private let codec = AMRCodecAdapter()
 
     // All RX decode work is deliberately kept off the CoreBluetooth/SwiftUI
