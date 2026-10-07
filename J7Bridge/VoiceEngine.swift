@@ -47,15 +47,6 @@ final class VoiceEngine: NSObject {
     var onAMRPacket: ((Data) -> Void)?
     var onStatus: ((String) -> Void)?
 
-    /// True only when the local audio graph is actually running. This is
-    /// intentionally separate from VOICE_OPEN state: CallKit may deactivate
-    /// and later reactivate the audio session while the same call UUID lives.
-    var isActuallyRunning: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return isRunning && audioEngine.isRunning
-    }
-
     private let codec = AMRCodecAdapter()
 
     // All RX decode work is deliberately kept off the CoreBluetooth/SwiftUI
@@ -68,24 +59,13 @@ final class VoiceEngine: NSObject {
     )
     private let stateLock = NSLock()
 
-    // Pre-start RX is deliberately NOT queued. Live telephony audio must never
-    // replay old speech after CallKit/audio activation catches up.
-    // This is separate from the bounded worker queue below.
-
-    // This queue only serializes AMR decode work off CoreBluetooth. It is bounded
-    // to a few hundred milliseconds and oldest frames are discarded under load.
+    // This is a second bounded queue used only to prevent GCD itself from
+    // accumulating thousands of RX blocks when AMR decode is temporarily
+    // slower than the 20 ms packet arrival rate. Oldest frames are discarded
+    // so latency stays bounded instead of turning into delayed speech.
     private var rxWorkQueue: [(Data, UInt64)] = []
     private let maxRXWorkFrames = 20         // 400 ms @ 20 ms/frame
     private var rxWorkerScheduled = false
-
-    // Voice TX used to DispatchQueue.main.async once per 20 ms frame. If the
-    // main queue was busy during CallKit activation/UI work, hundreds of
-    // closures could accumulate and later send old microphone speech to J7.
-    // Keep at most ONE pending frame and always replace it with the newest.
-    private let txDispatchLock = NSLock()
-    private var pendingTXFrame: (Data, UInt64)?
-    private var txDispatchScheduled = false
-    private var txDispatchWorkItem: DispatchWorkItem?
 
     private var acceptsRX = false
     private var sessionGeneration: UInt64 = 0
@@ -147,7 +127,7 @@ final class VoiceEngine: NSObject {
 
         stateLock.lock()
         sessionGeneration &+= 1
-        acceptsRX = false
+        acceptsRX = true
         isRunning = false
         converter = nil
         rxWorkQueue.removeAll(keepingCapacity: true)
@@ -161,7 +141,6 @@ final class VoiceEngine: NSObject {
         pcmAccumulator.removeAll(keepingCapacity: true)
         stateLock.unlock()
 
-        cancelPendingTX()
         playerNode.stop()
         playerNode.reset()
         audioEngine.stop()
@@ -185,9 +164,6 @@ final class VoiceEngine: NSObject {
         scheduledPlaybackFrames = 0
         pcmAccumulator.removeAll(keepingCapacity: true)
         stateLock.unlock()
-
-        // Invalidate the TX dispatch before tearing down the player graph.
-        cancelPendingTX()
 
         // Wait for an already-running RX decode block to observe the new
         // generation before tearing down the player graph.
@@ -319,7 +295,6 @@ final class VoiceEngine: NSObject {
 
             stateLock.lock()
             isRunning = true
-            let generation = sessionGeneration
             stateLock.unlock()
 
             // Mark running before engine start so the first callback cannot be
@@ -328,22 +303,6 @@ final class VoiceEngine: NSObject {
             NSLog("[CALLSHARE_AUDIO_R1] engine prepared; engineRunning=\(audioEngine.isRunning)")
             try audioEngine.start()
             NSLog("[CALLSHARE_AUDIO_R1] engine.start SUCCESS isRunning=\(audioEngine.isRunning)")
-
-            // Apply the output route AFTER CallKit activation, without
-            // deactivating/re-activating the shared call session. This fixes the
-            // incomplete R3 speaker change where .defaultToSpeaker alone could
-            // leave playback on the receiver route.
-            do {
-                try audioSession.overrideOutputAudioPort(useSpeaker ? .speaker : .none)
-                NSLog("[CALLSHARE_AUDIO_R4] output override=\(useSpeaker ? "speaker" : "none") route=\(routeDescription())")
-            } catch {
-                NSLog("[CALLSHARE_AUDIO_R4] output override deferred ERROR=\(error.localizedDescription)")
-            }
-
-            stateLock.lock()
-            acceptsRX = true
-            stateLock.unlock()
-
             playerNode.play()
             NSLog("[CALLSHARE_AUDIO_R1] playerNode.play isPlaying=\(playerNode.isPlaying)")
             NSLog("[CALLSHARE_AUDIO_R1] output format=\(audioEngine.outputNode.outputFormat(forBus: 0))")
@@ -358,9 +317,6 @@ final class VoiceEngine: NSObject {
                 )
             )
 
-            // No pre-start RX queue exists in R4. The live stream begins only
-            // after this engine is running and VOICE_OPEN is sent by AppModel.
-            _ = generation
             return true
         } catch {
             stateLock.lock()
@@ -372,7 +328,6 @@ final class VoiceEngine: NSObject {
             playerNode.stop()
             playerNode.reset()
             converter = nil
-            cancelPendingTX()
             reportStatus("ERROR AudioEngine: \(error.localizedDescription)")
             return false
         }
@@ -466,19 +421,15 @@ final class VoiceEngine: NSObject {
         }
 
         if !isRunning {
-            if pendingRXFrames.count >= maxPendingRXFrames {
-                pendingRXFrames.removeFirst()
-                droppedRx += 1
-                if droppedRx == 1 || droppedRx % 25 == 0 {
-                    reportStatus("[AMR] RX queue overflow; dropped oldest frame")
-                }
-            }
-            pendingRXFrames.append(packet)
-            let depth = pendingRXFrames.count
+            // R4: never retain AMR while the audio engine is stopped.
+            // Frames received before CallKit audio activation are stale for a
+            // real-time call and must not be replayed later as delayed speech.
+            droppedRx += 1
+            let dropped = droppedRx
             stateLock.unlock()
 
-            if depth == 1 {
-                reportStatus("[AMR] RX queued while engine stopped count=1 len=\(packet.count)")
+            if dropped == 1 || dropped % 25 == 0 {
+                reportStatus("[AMR] RX dropped while engine stopped len=\(packet.count)")
             }
             return
         }
@@ -625,81 +576,19 @@ final class VoiceEngine: NSObject {
                 reportStatus("[AMR] TX frame #\(frameNumber) len=\(amr.count) mode=\(codec.encoderMode)")
             }
 
-            // CoreBluetooth writes stay on the main queue for BLEManager state
-            // safety, but R4 never schedules one main-queue closure per audio
-            // frame. The coalescer keeps at most ONE pending microphone frame,
-            // replacing stale audio with the newest frame.
-            enqueueTXFrame(amr, generation: generation)
-        }
-    }
-
-    private func enqueueTXFrame(_ amr: Data, generation: UInt64) {
-        txDispatchLock.lock()
-        pendingTXFrame = (amr, generation)
-
-        if txDispatchScheduled {
-            txDispatchLock.unlock()
-            return
-        }
-
-        txDispatchScheduled = true
-        let work = DispatchWorkItem { [weak self] in
-            self?.drainTXFrameOnMain()
-        }
-        txDispatchWorkItem = work
-        txDispatchLock.unlock()
-
-        DispatchQueue.main.async(execute: work)
-    }
-
-    private func drainTXFrameOnMain() {
-        txDispatchLock.lock()
-        let item = pendingTXFrame
-        pendingTXFrame = nil
-        txDispatchLock.unlock()
-
-        if let item {
-            let (frame, generation) = item
-
-            stateLock.lock()
-            let stillCurrent = acceptsRX && sessionGeneration == generation
-            stateLock.unlock()
-
-            txDispatchLock.lock()
-            let cancelled = txDispatchWorkItem?.isCancelled ?? false
-            txDispatchLock.unlock()
-
-            if stillCurrent && !cancelled {
-                onAMRPacket?(frame)
+            // CoreBluetooth work never runs directly on the audio callback.
+            // Fence queued main-queue work by call generation so a packet from
+            // call N cannot leak into call N+1 after a fast hangup/re-ring.
+            let callback = onAMRPacket
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                let stillCurrent = self.acceptsRX && self.sessionGeneration == generation
+                self.stateLock.unlock()
+                guard stillCurrent else { return }
+                callback?(amr)
             }
         }
-
-        txDispatchLock.lock()
-        let needsAnotherDrain = pendingTXFrame != nil
-        if !needsAnotherDrain {
-            txDispatchScheduled = false
-            txDispatchWorkItem = nil
-        }
-        txDispatchLock.unlock()
-
-        if needsAnotherDrain {
-            let work = DispatchWorkItem { [weak self] in
-                self?.drainTXFrameOnMain()
-            }
-            txDispatchLock.lock()
-            txDispatchWorkItem = work
-            txDispatchLock.unlock()
-            DispatchQueue.main.async(execute: work)
-        }
-    }
-
-    private func cancelPendingTX() {
-        txDispatchLock.lock()
-        txDispatchWorkItem?.cancel()
-        txDispatchWorkItem = nil
-        pendingTXFrame = nil
-        txDispatchScheduled = false
-        txDispatchLock.unlock()
     }
 
     private func schedulePlayback(_ pcm: [Int16], generation: UInt64) {
