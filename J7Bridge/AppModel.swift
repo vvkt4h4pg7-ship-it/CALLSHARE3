@@ -53,6 +53,9 @@ final class AppModel: ObservableObject {
     // R3: K7 voice must not be opened until CallKit audio is actually active
     // and the local VoiceEngine has started successfully.
     private var voiceOpenRequested = false
+    private var voiceOpenSentAt: TimeInterval?
+    private var voiceOpenRetryCount = 0
+    private var voiceOpenRetryWorkItem: DispatchWorkItem?
 
     /// Monotonically increasing CallShare session token. Every new call gets a
     /// new token; asynchronous CallKit completions capture their token so an
@@ -253,9 +256,11 @@ final class AppModel: ObservableObject {
             }
 
             remoteVoiceOpen = false
-            // R3: DO NOT open the remote GSM voice stream yet. CallKit audio
-            // activation and the local VoiceEngine must win the race first.
-            // maybeStartVoice() will start the engine, then request VOICE_OPEN.
+
+            // R5 HYBRID HANDSHAKE: open K7's GSM voice side immediately after
+            // ANSWER. Local CallKit/audio activation runs in parallel; the
+            // VoiceEngine keeps a tiny pre-start RX buffer for early AMR.
+            sendVoiceOpen(reason: "K7 ANSWER / EARLY")
             maybeStartVoice()
 
         case K7Protocol.evtReceiveCallEnd:
@@ -271,9 +276,9 @@ final class AppModel: ObservableObject {
                 return
             }
             remoteVoiceOpen = true
+            voiceOpenRetryWorkItem?.cancel()
+            voiceOpenRetryWorkItem = nil
             log("[VOICE] OPEN EVENT / K7 ACK")
-            // VoiceEngine should already be running because R3 sends
-            // VOICE_OPEN only after CallKit audio activation.
             maybeStartVoice()
 
         case K7Protocol.evtVoiceClose:
@@ -337,6 +342,10 @@ final class AppModel: ObservableObject {
         callAudioActive = false
         remoteVoiceOpen = false
         voiceOpenRequested = false
+        voiceOpenSentAt = nil
+        voiceOpenRetryCount = 0
+        voiceOpenRetryWorkItem?.cancel()
+        voiceOpenRetryWorkItem = nil
         isMuted = false
         callStatus = "RINGING"
         log("[CALL] SESSION BEGIN #\(sessionID) INCOMING \(name.map { "\($0) / " } ?? "")\(incomingNumber)")
@@ -386,6 +395,10 @@ final class AppModel: ObservableObject {
         callAudioActive = false
         remoteVoiceOpen = false
         voiceOpenRequested = false
+        voiceOpenSentAt = nil
+        voiceOpenRetryCount = 0
+        voiceOpenRetryWorkItem?.cancel()
+        voiceOpenRetryWorkItem = nil
         isMuted = false
         callStatus = "DIALING"
 
@@ -419,34 +432,62 @@ final class AppModel: ObservableObject {
             return
         }
 
-        // CallKit activation is the hard local readiness gate.
+        // CallKit activation remains the local audio readiness gate. K7 voice
+        // is deliberately opened earlier in R5.
         guard callAudioActive else {
             log("[VOICE] WAIT CallKit audio activation")
             return
         }
 
-        // VOICE_OPEN is remote state; it is NOT a substitute for the local
-        // engine state. A transient CallKit route/deactivation can leave
-        // voiceOpenRequested=true while the local graph has stopped.
         if !voice.isActuallyRunning {
             log("[VOICE] AUDIO READY -> VoiceEngine.start()")
+            let startUptime = ProcessInfo.processInfo.systemUptime
             guard voice.start() else {
-                log("[VOICE] START FAILED -> VOICE_OPEN not sent")
+                log("[VOICE] START FAILED")
                 return
             }
-            log("[VOICE] ENGINE RUNNING")
+            let elapsedMs = Int((ProcessInfo.processInfo.systemUptime - startUptime) * 1000.0)
+            log("[VOICE] ENGINE RUNNING startCost=\(elapsedMs)ms")
         }
 
         if !voiceOpenRequested {
-            voiceOpenRequested = true
-            log("[VOICE] ENGINE READY -> K7 VOICE_OPEN")
-            ble.sendVoiceOpen()
+            sendVoiceOpen(reason: "ENGINE READY / FALLBACK")
         } else if !remoteVoiceOpen {
-            // Re-open the K7 side after a transient remote close without
-            // rebuilding the iPhone audio graph.
-            log("[VOICE] ENGINE RUNNING -> re-request K7 VOICE_OPEN")
-            ble.sendVoiceOpen()
+            let ageMs: Int
+            if let sent = voiceOpenSentAt {
+                ageMs = Int((ProcessInfo.processInfo.systemUptime - sent) * 1000.0)
+            } else {
+                ageMs = -1
+            }
+            log("[VOICE] waiting for K7 VOICE_OPEN ACK age=\(ageMs)ms retry=\(voiceOpenRetryCount)")
         }
+    }
+
+    private func sendVoiceOpen(reason: String) {
+        voiceOpenRequested = true
+        voiceOpenSentAt = ProcessInfo.processInfo.systemUptime
+        log("[VOICE] VOICE_OPEN -> K7 reason=\(reason)")
+        ble.sendVoiceOpen()
+        scheduleVoiceOpenRetry()
+    }
+
+    private func scheduleVoiceOpenRetry() {
+        voiceOpenRetryWorkItem?.cancel()
+        guard voiceOpenRetryCount < 2 else { return }
+
+        let delay: Double = (voiceOpenRetryCount == 0) ? 0.30 : 0.70
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.callStatus == "ACTIVE", self.voiceOpenRequested, !self.remoteVoiceOpen else { return }
+
+            self.voiceOpenRetryCount += 1
+            self.voiceOpenSentAt = ProcessInfo.processInfo.systemUptime
+            self.log("[VOICE] VOICE_OPEN RETRY #\(self.voiceOpenRetryCount)")
+            self.ble.sendVoiceOpen()
+            self.scheduleVoiceOpenRetry()
+        }
+        voiceOpenRetryWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func endFromCallKit() {
@@ -490,6 +531,10 @@ final class AppModel: ObservableObject {
         // prevents uplink AMR from one call being delivered into the next.
         remoteVoiceOpen = false
         voiceOpenRequested = false
+        voiceOpenSentAt = nil
+        voiceOpenRetryCount = 0
+        voiceOpenRetryWorkItem?.cancel()
+        voiceOpenRetryWorkItem = nil
         callAudioActive = false
         voice.stop()
         voice.endCallSession()
@@ -526,6 +571,10 @@ final class AppModel: ObservableObject {
         if sendHangup { ble.sendHangup() }
         remoteVoiceOpen = false
         voiceOpenRequested = false
+        voiceOpenSentAt = nil
+        voiceOpenRetryCount = 0
+        voiceOpenRetryWorkItem?.cancel()
+        voiceOpenRetryWorkItem = nil
         callAudioActive = false
         voice.stop()
         voice.endCallSession()

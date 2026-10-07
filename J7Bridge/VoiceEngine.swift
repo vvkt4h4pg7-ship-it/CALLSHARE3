@@ -76,6 +76,18 @@ final class VoiceEngine: NSObject {
     private let maxRXWorkFrames = 20         // 400 ms @ 20 ms/frame
     private var rxWorkerScheduled = false
 
+    // R5: K7 may start streaming immediately after VOICE_OPEN while CallKit
+    // is still activating the local audio graph. Keep only five 20 ms AMR frames
+    // during that startup race; this prevents stale multi-second catch-up.
+    private var preStartRXFrames: [(Data, UInt64)] = []
+    private let maxPreStartRXFrames = 5      // ~100 ms @ 20 ms/frame
+
+    // R5: a busy main queue must not turn microphone frames into an old backlog.
+    // One pending slot always forwards the newest AMR frame.
+    private let txDispatchLock = NSLock()
+    private var pendingTXFrame: (Data, UInt64)?
+    private var txDispatchScheduled = false
+
     private var acceptsRX = false
     private var sessionGeneration: UInt64 = 0
 
@@ -141,6 +153,8 @@ final class VoiceEngine: NSObject {
         converter = nil
         rxWorkQueue.removeAll(keepingCapacity: true)
         rxWorkerScheduled = false
+        preStartRXFrames.removeAll(keepingCapacity: true)
+        cancelPendingTX()
         playbackGeneration &+= 1
         scheduledPlaybackFrames = 0
         txFrames = 0
@@ -169,6 +183,8 @@ final class VoiceEngine: NSObject {
         isRunning = false
         converter = nil
         rxWorkQueue.removeAll(keepingCapacity: true)
+        preStartRXFrames.removeAll(keepingCapacity: true)
+        cancelPendingTX()
         playbackGeneration &+= 1
         scheduledPlaybackFrames = 0
         pcmAccumulator.removeAll(keepingCapacity: true)
@@ -199,7 +215,7 @@ final class VoiceEngine: NSObject {
                 options: sessionOptions()
             )
             try audioSession.setPreferredSampleRate(8_000)
-            try audioSession.setPreferredIOBufferDuration(0.02)
+            try audioSession.setPreferredIOBufferDuration(0.01)
             audioSessionPrepared = true
 
             NSLog("[CALLSHARE_AUDIO_R1] PREPARED category=\(audioSession.category.rawValue) mode=\(audioSession.mode.rawValue)")
@@ -308,12 +324,15 @@ final class VoiceEngine: NSObject {
 
             // Mark running before engine start so the first callback cannot be
             // rejected solely because the engine is transitioning to running.
+            let engineStartUptime = ProcessInfo.processInfo.systemUptime
             audioEngine.prepare()
             NSLog("[CALLSHARE_AUDIO_R1] engine prepared; engineRunning=\(audioEngine.isRunning)")
             try audioEngine.start()
-            NSLog("[CALLSHARE_AUDIO_R1] engine.start SUCCESS isRunning=\(audioEngine.isRunning)")
+            let engineStartMs = Int((ProcessInfo.processInfo.systemUptime - engineStartUptime) * 1000.0)
+            NSLog("[CALLSHARE_AUDIO_R1] engine.start SUCCESS isRunning=\(audioEngine.isRunning) costMs=\(engineStartMs)")
             playerNode.play()
             NSLog("[CALLSHARE_AUDIO_R1] playerNode.play isPlaying=\(playerNode.isPlaying)")
+            flushPreStartRX()
             NSLog("[CALLSHARE_AUDIO_R1] output format=\(audioEngine.outputNode.outputFormat(forBus: 0))")
             NSLog("[CALLSHARE_AUDIO_R1] mixer output format=\(audioEngine.mainMixerNode.outputFormat(forBus: 0))")
 
@@ -380,6 +399,28 @@ final class VoiceEngine: NSObject {
         }
 
         let generation = sessionGeneration
+
+        if !isRunning {
+            if preStartRXFrames.count >= maxPreStartRXFrames {
+                preStartRXFrames.removeFirst()
+                droppedRx += 1
+                let dropped = droppedRx
+                preStartRXFrames.append((packet, generation))
+                stateLock.unlock()
+                if dropped == 1 || dropped % 25 == 0 {
+                    reportStatus("[AMR] PRESTART RX buffer full; dropped oldest frame")
+                }
+            } else {
+                preStartRXFrames.append((packet, generation))
+                let count = preStartRXFrames.count
+                stateLock.unlock()
+                if count == 1 {
+                    reportStatus("[AMR] PRESTART buffered len=\(packet.count)")
+                }
+            }
+            return
+        }
+
         if rxWorkQueue.count >= maxRXWorkFrames {
             rxWorkQueue.removeFirst()
             droppedRx += 1
@@ -400,6 +441,29 @@ final class VoiceEngine: NSObject {
         if shouldStartWorker { rxWorkerScheduled = true }
         stateLock.unlock()
 
+        if shouldStartWorker {
+            rxQueue.async { [weak self] in
+                self?.drainRXWorkQueue()
+            }
+        }
+    }
+
+    private func flushPreStartRX() {
+        stateLock.lock()
+        guard !preStartRXFrames.isEmpty else {
+            stateLock.unlock()
+            return
+        }
+
+        let buffered = preStartRXFrames
+        preStartRXFrames.removeAll(keepingCapacity: true)
+        rxWorkQueue.insert(contentsOf: buffered, at: 0)
+        let shouldStartWorker = !rxWorkerScheduled
+        if shouldStartWorker { rxWorkerScheduled = true }
+        let count = buffered.count
+        stateLock.unlock()
+
+        reportStatus("[AMR] PRESTART flush frames=\(count)")
         if shouldStartWorker {
             rxQueue.async { [weak self] in
                 self?.drainRXWorkQueue()
@@ -429,19 +493,6 @@ final class VoiceEngine: NSObject {
             return
         }
 
-        if !isRunning {
-            // R4: never retain AMR while the audio engine is stopped.
-            // Frames received before CallKit audio activation are stale for a
-            // real-time call and must not be replayed later as delayed speech.
-            droppedRx += 1
-            let dropped = droppedRx
-            stateLock.unlock()
-
-            if dropped == 1 || dropped % 25 == 0 {
-                reportStatus("[AMR] RX dropped while engine stopped len=\(packet.count)")
-            }
-            return
-        }
         stateLock.unlock()
 
         guard let frameInfo = codec.validateAndLearnMode(packet) else {
@@ -586,18 +637,61 @@ final class VoiceEngine: NSObject {
             }
 
             // CoreBluetooth work never runs directly on the audio callback.
-            // Fence queued main-queue work by call generation so a packet from
-            // call N cannot leak into call N+1 after a fast hangup/re-ring.
-            let callback = onAMRPacket
+            // Coalesce the main-queue handoff so startup/UI work cannot create
+            // a backlog of old microphone frames.
+            enqueueTXFrame(amr, generation: generation)
+        }
+    }
+
+    private func enqueueTXFrame(_ amr: Data, generation: UInt64) {
+        txDispatchLock.lock()
+        pendingTXFrame = (amr, generation)
+        let shouldSchedule = !txDispatchScheduled
+        if shouldSchedule { txDispatchScheduled = true }
+        txDispatchLock.unlock()
+
+        guard shouldSchedule else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.drainTXFrameOnMain()
+        }
+    }
+
+    private func drainTXFrameOnMain() {
+        txDispatchLock.lock()
+        guard let pending = pendingTXFrame else {
+            txDispatchScheduled = false
+            txDispatchLock.unlock()
+            return
+        }
+        pendingTXFrame = nil
+        txDispatchScheduled = false
+        txDispatchLock.unlock()
+
+        let (amr, generation) = pending
+        stateLock.lock()
+        let stillCurrent = acceptsRX && sessionGeneration == generation
+        stateLock.unlock()
+        guard stillCurrent else { return }
+
+        onAMRPacket?(amr)
+
+        txDispatchLock.lock()
+        let morePending = pendingTXFrame != nil && !txDispatchScheduled
+        if morePending { txDispatchScheduled = true }
+        txDispatchLock.unlock()
+
+        if morePending {
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.stateLock.lock()
-                let stillCurrent = self.acceptsRX && self.sessionGeneration == generation
-                self.stateLock.unlock()
-                guard stillCurrent else { return }
-                callback?(amr)
+                self?.drainTXFrameOnMain()
             }
         }
+    }
+
+    private func cancelPendingTX() {
+        txDispatchLock.lock()
+        pendingTXFrame = nil
+        txDispatchScheduled = false
+        txDispatchLock.unlock()
     }
 
     private func schedulePlayback(_ pcm: [Int16], generation: UInt64) {

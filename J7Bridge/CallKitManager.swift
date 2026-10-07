@@ -272,6 +272,7 @@ extension CallKitManager: CXProviderDelegate {
         onLog?("[CALLSHARE_AUDIO_R1] inputChannels=\(audioSession.inputNumberOfChannels)")
         onLog?("[CALLSHARE_AUDIO_R1] outputChannels=\(audioSession.outputNumberOfChannels)")
         onLog?("[CALLSHARE_AUDIO_R1] ioBuffer=\(audioSession.ioBufferDuration)")
+        onLog?("[CALLSHARE_AUDIO_R5] didActivate uptime=\(String(format: "%.3f", ProcessInfo.processInfo.systemUptime))")
         let route = audioSession.currentRoute
         let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
         let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
